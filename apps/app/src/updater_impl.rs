@@ -548,6 +548,48 @@ pub fn remove_enqueued_update<R: Runtime>(webview: Webview<R>) {
 
 // ── Package-manager updates ─────────────────────────────────────
 
+/// Resolve a program the install paths may execute.
+///
+/// `pkexec` and the package manager are started by absolute path instead of
+/// letting `Command` search `PATH`: a launcher started from a shell wrapper can
+/// have a writable directory ahead of the system ones, and a planted `pkexec`
+/// would be the program that collects the password.
+fn system_program(name: &str) -> Result<std::path::PathBuf> {
+    theseus::system_command_path(name).ok_or_else(|| {
+        theseus::Error::from(theseus::ErrorKind::OtherError(format!(
+            "The update needs {name}, but it was not found in a system location"
+        )))
+        .into()
+    })
+}
+
+fn pkexec_program() -> Result<std::path::PathBuf> {
+    theseus::pkexec_path().ok_or_else(|| {
+        theseus::Error::from(theseus::ErrorKind::OtherError(
+            "The update needs pkexec, but it was not found in a system location"
+                .to_string(),
+        ))
+        .into()
+    })
+}
+
+/// `apt` performs part of the install as the unprivileged `_apt` user, which
+/// cannot read a `0700` directory, so the staged package has to be reachable
+/// from that sandbox. The random directory name keeps the path unpredictable;
+/// the mode only stops hiding it from another unprivileged user.
+#[cfg(unix)]
+fn expose_staged_package(
+    directory: &std::path::Path,
+    package: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        directory,
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    std::fs::set_permissions(package, std::fs::Permissions::from_mode(0o644))
+}
+
 /// Install the downloaded .deb when a dpkg database owns this installation,
 /// prompting for root once via `pkexec`. The package is installed from the
 /// absolute path of a temporary file, which is removed afterwards.
@@ -584,11 +626,19 @@ pub async fn install_apt_package(version: &str, data: &[u8]) -> Result<()> {
             "Failed to write the downloaded deb: {io}"
         )))
     })?;
+    #[cfg(unix)]
+    expose_staged_package(staging.path(), &deb_path).map_err(|io| {
+        theseus::Error::from(theseus::ErrorKind::OtherError(format!(
+            "Failed to make the staged deb readable: {io}"
+        )))
+    })?;
 
     let install_path = deb_path.clone();
+    let pkexec = pkexec_program()?;
+    let apt = system_program("apt")?;
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("pkexec")
-            .arg("apt")
+        std::process::Command::new(&pkexec)
+            .arg(&apt)
             .arg("install")
             .arg("-y")
             .arg(&install_path)
@@ -645,9 +695,15 @@ async fn install_rpm_package(
             "Failed to write the downloaded rpm: {io}"
         )))
     })?;
+    #[cfg(unix)]
+    expose_staged_package(staging.path(), &rpm_path).map_err(|io| {
+        theseus::Error::from(theseus::ErrorKind::OtherError(format!(
+            "Failed to make the staged rpm readable: {io}"
+        )))
+    })?;
 
     let install_path = rpm_path.clone();
-    let (manager, arguments): (&'static str, &[&str]) = match frontend {
+    let (manager_name, arguments): (&'static str, &[&str]) = match frontend {
         Some(theseus::PackageFrontend::Zypper) => (
             "zypper",
             &["--non-interactive", "install", "--allow-unsigned-rpm"],
@@ -655,9 +711,11 @@ async fn install_rpm_package(
         // The catalog sha256 already verified this exact file.
         _ => ("dnf", &["install", "-y", "--nogpgcheck"]),
     };
+    let pkexec = pkexec_program()?;
+    let manager = system_program(manager_name)?;
     let output = tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new("pkexec");
-        command.arg(manager);
+        let mut command = std::process::Command::new(&pkexec);
+        command.arg(&manager);
         for argument in arguments {
             command.arg(argument);
         }
@@ -678,7 +736,7 @@ async fn install_rpm_package(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(theseus::Error::from(theseus::ErrorKind::OtherError(
-            format!("{manager} install failed: {}", stderr.trim()),
+            format!("{manager_name} install failed: {}", stderr.trim()),
         ))
         .into());
     }
@@ -771,5 +829,40 @@ mod tests {
                 "accepted invalid path: {path}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod install_tests {
+    use super::{expose_staged_package, pkexec_program, system_program};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_staged_package_is_reachable_from_the_package_manager_sandbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("axolotl.deb");
+        std::fs::write(&package, b"deb").unwrap();
+
+        expose_staged_package(directory.path(), &package).unwrap();
+
+        assert_eq!(mode(directory.path()), 0o755);
+        assert_eq!(mode(&package), 0o644);
+    }
+
+    #[test]
+    fn programs_are_resolved_instead_of_searched_in_path() {
+        assert!(system_program("").is_err());
+        assert!(system_program("no/such-program").is_err());
+        let sh = system_program("sh").expect("sh should resolve");
+        assert!(sh.is_absolute());
+    }
+
+    #[test]
+    fn pkexec_resolution_agrees_with_the_capability_check() {
+        assert_eq!(pkexec_program().is_ok(), theseus::has_pkexec());
     }
 }
