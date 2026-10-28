@@ -924,8 +924,33 @@ fn dpkg_frontend() -> Option<PackageFrontend> {
     command_available("apt-get").map(|_| PackageFrontend::Apt)
 }
 
+/// Whether an RPM-based system builds its root from an immutable image.
+///
+/// `dnf install` and `zypper install` are rejected there; the package lives in
+/// the ostree layer instead, so no single-package command applies. The RPM
+/// database still reports the package that owns the executable, which is why
+/// this only drops the frontend and keeps the source.
+#[cfg(target_os = "linux")]
+fn immutable_rpm_system_with(
+    ostree_booted: &std::path::Path,
+    transactional_update: &std::path::Path,
+) -> bool {
+    ostree_booted.exists() || transactional_update.exists()
+}
+
+#[cfg(target_os = "linux")]
+fn immutable_rpm_system() -> bool {
+    immutable_rpm_system_with(
+        std::path::Path::new("/run/ostree-booted"),
+        std::path::Path::new("/usr/sbin/transactional-update"),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn rpm_frontend() -> Option<PackageFrontend> {
+    if immutable_rpm_system() {
+        return None;
+    }
     command_available("dnf")
         .map(|_| PackageFrontend::Dnf)
         .or_else(|| {
@@ -1454,10 +1479,10 @@ mod install_source_tests {
     use super::{
         InstallSource, OwnedPackage, PackageDatabase, PackageFrontend,
         classify_install_source, database_store, exit_means_not_owned,
-        inside_flatpak_sandbox, is_system_path, parse_dpkg_fields,
-        parse_dpkg_search, parse_pacman_architecture, parse_pacman_owners,
-        parse_rpm_records, path_has_content, run_command_with_timeout,
-        store_has_content, system_command_path,
+        immutable_rpm_system_with, inside_flatpak_sandbox, is_system_path,
+        parse_dpkg_fields, parse_dpkg_search, parse_pacman_architecture,
+        parse_pacman_owners, parse_rpm_records, path_has_content,
+        run_command_with_timeout, store_has_content, system_command_path,
     };
 
     fn owned(
@@ -1864,5 +1889,17 @@ mod install_source_tests {
         assert!(!inside_flatpak_sandbox(&marker));
         std::fs::write(&marker, "").unwrap();
         assert!(inside_flatpak_sandbox(&marker));
+    }
+    #[test]
+    fn immutable_rpm_systems_have_no_single_package_frontend() {
+        let root = tempfile::tempdir().unwrap();
+        let ostree = root.path().join("ostree-booted");
+        let transactional = root.path().join("transactional-update");
+        assert!(!immutable_rpm_system_with(&ostree, &transactional));
+        std::fs::write(&ostree, "").unwrap();
+        assert!(immutable_rpm_system_with(&ostree, &transactional));
+        std::fs::remove_file(&ostree).unwrap();
+        std::fs::write(&transactional, "").unwrap();
+        assert!(immutable_rpm_system_with(&ostree, &transactional));
     }
 }
