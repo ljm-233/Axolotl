@@ -48,12 +48,19 @@ fn update_command(source: &InstallSource) -> Option<String> {
                 PackageFrontend::Pacman => {
                     // `pacman -S` cannot see an update published after the
                     // last database refresh, while `-Syu` would upgrade every
-                    // package on the system; refresh and upgrade only the
-                    // launcher.
+                    // package on the system; refresh the database and upgrade
+                    // only the launcher.
                     format!("sudo pacman -Sy {}", package.name)
                 }
-                PackageFrontend::Yay => format!("yay -S {}", package.name),
-                PackageFrontend::Paru => format!("paru -S {}", package.name),
+                // The AUR helpers refresh the repositories themselves, but the
+                // packagist spelling keeps the suggestion consistent with the
+                // pacman one above.
+                PackageFrontend::Yay => {
+                    format!("yay -Sy {}", package.name)
+                }
+                PackageFrontend::Paru => {
+                    format!("paru -Sy {}", package.name)
+                }
             })
         }
         // The app ID comes from the environment, so only accept the
@@ -164,7 +171,7 @@ mod tests {
                 "axolotl-launcher-bin"
             ))
             .as_deref(),
-            Some("yay -S axolotl-launcher-bin")
+            Some("yay -Sy axolotl-launcher-bin")
         );
         assert_eq!(
             update_command(&managed(
@@ -172,7 +179,7 @@ mod tests {
                 "axolotl-launcher-bin"
             ))
             .as_deref(),
-            Some("paru -S axolotl-launcher-bin")
+            Some("paru -Sy axolotl-launcher-bin")
         );
     }
 
