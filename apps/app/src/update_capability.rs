@@ -46,7 +46,11 @@ fn update_command(source: &InstallSource) -> Option<String> {
                     format!("sudo zypper update {}", package.name)
                 }
                 PackageFrontend::Pacman => {
-                    format!("sudo pacman -S {}", package.name)
+                    // `pacman -S` cannot see an update published after the
+                    // last database refresh, while `-Syu` would upgrade every
+                    // package on the system; refresh and upgrade only the
+                    // launcher.
+                    format!("sudo pacman -Sy {}", package.name)
                 }
                 PackageFrontend::Yay => format!("yay -S {}", package.name),
                 PackageFrontend::Paru => format!("paru -S {}", package.name),
@@ -113,5 +117,122 @@ pub async fn get_update_capability() -> UpdateCapability {
                 owners: Vec::new(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_package_name, is_valid_flatpak_id, update_command};
+    use theseus::{
+        InstallSource, OwnedPackage, PackageDatabase, PackageFrontend,
+    };
+
+    fn managed(frontend: PackageFrontend, name: &str) -> InstallSource {
+        let database = match frontend {
+            PackageFrontend::Apt => PackageDatabase::Dpkg,
+            PackageFrontend::Dnf | PackageFrontend::Zypper => {
+                PackageDatabase::Rpm
+            }
+            PackageFrontend::Pacman
+            | PackageFrontend::Yay
+            | PackageFrontend::Paru => PackageDatabase::Pacman,
+        };
+        InstallSource::Managed(OwnedPackage {
+            database,
+            frontend: Some(frontend),
+            name: name.to_string(),
+            version: None,
+            architecture: None,
+        })
+    }
+
+    #[test]
+    fn pacman_refreshes_the_database_for_the_launcher_only() {
+        // `-Syu` would upgrade every package, and `-S` alone cannot see an
+        // update published after the last refresh.
+        assert_eq!(
+            update_command(&managed(
+                PackageFrontend::Pacman,
+                "axolotl-launcher-bin"
+            ))
+            .as_deref(),
+            Some("sudo pacman -Sy axolotl-launcher-bin")
+        );
+        assert_eq!(
+            update_command(&managed(
+                PackageFrontend::Yay,
+                "axolotl-launcher-bin"
+            ))
+            .as_deref(),
+            Some("yay -S axolotl-launcher-bin")
+        );
+        assert_eq!(
+            update_command(&managed(
+                PackageFrontend::Paru,
+                "axolotl-launcher-bin"
+            ))
+            .as_deref(),
+            Some("paru -S axolotl-launcher-bin")
+        );
+    }
+
+    #[test]
+    fn other_frontends_upgrade_the_named_package() {
+        assert_eq!(
+            update_command(&managed(PackageFrontend::Apt, "axolotl"))
+                .as_deref(),
+            Some("sudo apt install --only-upgrade axolotl")
+        );
+        assert_eq!(
+            update_command(&managed(PackageFrontend::Dnf, "axolotl"))
+                .as_deref(),
+            Some("sudo dnf upgrade axolotl")
+        );
+        assert_eq!(
+            update_command(&managed(PackageFrontend::Zypper, "axolotl"))
+                .as_deref(),
+            Some("sudo zypper update axolotl")
+        );
+    }
+
+    #[test]
+    fn a_source_without_a_frontend_or_command_stays_silent() {
+        let no_frontend = InstallSource::Managed(OwnedPackage {
+            database: PackageDatabase::Dpkg,
+            frontend: None,
+            name: "axolotl".to_string(),
+            version: None,
+            architecture: None,
+        });
+        for source in [
+            no_frontend,
+            InstallSource::Portable,
+            InstallSource::AppImage,
+            InstallSource::Nix,
+            InstallSource::Unconfirmed,
+            InstallSource::QueryFailed,
+            InstallSource::Conflict(Vec::new()),
+        ] {
+            assert_eq!(update_command(&source), None);
+        }
+    }
+
+    #[test]
+    fn a_package_name_that_could_escape_the_command_is_rejected() {
+        assert!(!is_safe_package_name("axolotl; rm -rf ~"));
+        assert!(!is_safe_package_name("axolotl && reboot"));
+        assert!(!is_safe_package_name(""));
+        assert!(is_safe_package_name("axolotl-launcher-bin"));
+        assert_eq!(
+            update_command(&managed(PackageFrontend::Pacman, "axolotl;reboot")),
+            None
+        );
+    }
+
+    #[test]
+    fn flatpak_ids_must_look_like_an_application_id() {
+        assert!(is_valid_flatpak_id("red.ghs.axolotl"));
+        assert!(!is_valid_flatpak_id("axolotl"));
+        assert!(!is_valid_flatpak_id("red.ghs.axolotl; reboot"));
     }
 }
