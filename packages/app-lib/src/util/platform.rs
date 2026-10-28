@@ -1147,8 +1147,15 @@ fn classify_install_source(
     InstallSource::Portable
 }
 
-fn env_present(key: &str) -> bool {
-    std::env::var_os(key).is_some_and(|value| !value.is_empty())
+/// Whether this process runs inside a Flatpak sandbox.
+///
+/// `/.flatpak-info` is created by the runtime for every sandbox, so it is the
+/// authoritative marker. `FLATPAK_ID` on its own is not: a wrapper script or a
+/// `flatpak-spawn --host` environment leaks it into an unsandboxed process,
+/// which would then be denied its own updater.
+#[cfg(target_os = "linux")]
+fn inside_flatpak_sandbox(marker: &std::path::Path) -> bool {
+    marker.exists()
 }
 
 /// Whether this process really runs from an AppImage.
@@ -1280,9 +1287,7 @@ fn detect_install_source_uncached() -> InstallSource {
         if running_inside_appimage() {
             return InstallSource::AppImage;
         }
-        if std::path::Path::new("/.flatpak-info").exists()
-            || env_present("FLATPAK_ID")
-        {
+        if inside_flatpak_sandbox(std::path::Path::new("/.flatpak-info")) {
             return InstallSource::Flatpak;
         }
 
@@ -1449,10 +1454,10 @@ mod install_source_tests {
     use super::{
         InstallSource, OwnedPackage, PackageDatabase, PackageFrontend,
         classify_install_source, database_store, exit_means_not_owned,
-        is_system_path, parse_dpkg_fields, parse_dpkg_search,
-        parse_pacman_architecture, parse_pacman_owners, parse_rpm_records,
-        path_has_content, run_command_with_timeout, store_has_content,
-        system_command_path,
+        inside_flatpak_sandbox, is_system_path, parse_dpkg_fields,
+        parse_dpkg_search, parse_pacman_architecture, parse_pacman_owners,
+        parse_rpm_records, path_has_content, run_command_with_timeout,
+        store_has_content, system_command_path,
     };
 
     fn owned(
@@ -1851,5 +1856,13 @@ mod install_source_tests {
         .expect("a fast query should return");
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    }
+    #[test]
+    fn flatpak_needs_the_sandbox_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join(".flatpak-info");
+        assert!(!inside_flatpak_sandbox(&marker));
+        std::fs::write(&marker, "").unwrap();
+        assert!(inside_flatpak_sandbox(&marker));
     }
 }
