@@ -656,19 +656,55 @@ fn command_available(name: &str) -> Option<String> {
     system_command_path(name).map(|path| path.to_string_lossy().into_owned())
 }
 
+/// How long one package-database or frontend query may take.
+///
+/// These tools answer instantly on a healthy system, but a locked or
+/// network-mounted database would otherwise block the capability query — which
+/// the settings page awaits — for as long as the tool wants.
+#[cfg(target_os = "linux")]
+const PACKAGE_QUERY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "linux")]
 fn run_command(
     program: &str,
     arguments: &[&str],
 ) -> Option<std::process::Output> {
+    run_command_with_timeout(program, arguments, PACKAGE_QUERY_TIMEOUT)
+}
+
+#[cfg(target_os = "linux")]
+fn run_command_with_timeout(
+    program: &str,
+    arguments: &[&str],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
     // Package tools translate their messages, and the parsers below match the
     // English wording, so pin the C locale instead of inheriting the user's.
-    std::process::Command::new(program)
+    let mut child = std::process::Command::new(program)
         .args(arguments)
         .env("LC_ALL", "C")
         .env("LANG", "C")
-        .output()
-        .ok()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    child.wait_with_output().ok()
 }
 
 /// Parse `dpkg-query --search` output, which looks like
@@ -1415,7 +1451,8 @@ mod install_source_tests {
         classify_install_source, database_store, exit_means_not_owned,
         is_system_path, parse_dpkg_fields, parse_dpkg_search,
         parse_pacman_architecture, parse_pacman_owners, parse_rpm_records,
-        path_has_content, store_has_content, system_command_path,
+        path_has_content, run_command_with_timeout, store_has_content,
+        system_command_path,
     };
 
     fn owned(
@@ -1788,5 +1825,31 @@ mod install_source_tests {
         assert!(system_command_path("bin/sh").is_none());
         let sh = system_command_path("sh").expect("sh should be installed");
         assert!(sh.is_absolute());
+    }
+    #[test]
+    fn a_hanging_query_is_killed_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let output = run_command_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 5"],
+            std::time::Duration::from_millis(150),
+        );
+        assert!(output.is_none(), "a killed query reports no output");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the query should be killed near its deadline"
+        );
+    }
+
+    #[test]
+    fn a_query_that_answers_in_time_keeps_its_output() {
+        let output = run_command_with_timeout(
+            "/bin/sh",
+            &["-c", "echo ok"],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("a fast query should return");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 }
