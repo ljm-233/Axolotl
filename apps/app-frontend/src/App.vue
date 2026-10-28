@@ -557,6 +557,7 @@ async function checkUpdates() {
     await resolveUpdateCapability()
     if (isPackageManagedInstall()) {
         console.log('Skipping update check: this installation is managed by its package manager')
+        updatesEnabled.value = false
         return
     }
 
@@ -2747,6 +2748,7 @@ async function manualUpdateCheck() {
         console.log(
             'Update checks are disabled: this installation is managed by its package manager',
         )
+        updatesEnabled.value = false
         return 'disabled'
     }
 
