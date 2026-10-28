@@ -51,7 +51,7 @@ pub use util::platform::{
     DistroFamily, InstallSource, LinuxDistro, OwnedPackage, PackageDatabase,
     PackageFrontend, PackageManager, detect_install_source,
     detect_linux_distro, has_pkexec, is_process_elevated, is_wsl,
-    kernel_release,
+    kernel_release, pkexec_path, system_command_path,
 };
 pub use util::proxy::{
     ProxyConfig, ProxyMode, ProxyTestResult, test_proxy_connection,

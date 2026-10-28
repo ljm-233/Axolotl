@@ -468,11 +468,30 @@ pub fn is_wsl() -> bool {
     })
 }
 
+/// Absolute path of a program in a standard system location.
+///
+/// The update paths resolve their programs once instead of letting `Command`
+/// search `PATH`: a launcher started from a shell wrapper can have a writable
+/// directory ahead of the system ones, and a planted `pkexec` would be the
+/// program that ends up collecting the password.
+pub fn system_command_path(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .iter()
+        .map(|directory| std::path::Path::new(directory).join(name))
+        .find(|path| path.exists())
+}
+
+/// Absolute path of `pkexec`, when it is installed.
+pub fn pkexec_path() -> Option<std::path::PathBuf> {
+    system_command_path("pkexec")
+}
+
 /// Whether `pkexec` is available for a single privileged prompt.
 pub fn has_pkexec() -> bool {
-    ["/usr/bin/pkexec", "/bin/pkexec"]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
+    pkexec_path().is_some()
 }
 
 /// Local package database that can claim ownership of a file. There are far
@@ -634,10 +653,7 @@ impl InstallSource {
 
 #[cfg(target_os = "linux")]
 fn command_available(name: &str) -> Option<String> {
-    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-        .iter()
-        .map(|directory| format!("{directory}/{name}"))
-        .find(|path| std::path::Path::new(path).exists())
+    system_command_path(name).map(|path| path.to_string_lossy().into_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -789,6 +805,45 @@ enum OwnerQuery {
     Failed,
 }
 
+/// Whether a directory or file has content a database query can read. An empty
+/// directory is what an uninitialised package database looks like.
+#[cfg(target_os = "linux")]
+fn path_has_content(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false),
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Where each database keeps its package store. A tool can be installed on a
+/// system that never initialised its database — an `rpm` package on Debian, for
+/// example — and asking it then fails in a way that says nothing about
+/// ownership. Treating that as "this database does not apply" keeps a clear hit
+/// from another database from being reported as a failed query.
+#[cfg(target_os = "linux")]
+fn database_store(database: PackageDatabase) -> &'static [&'static str] {
+    match database {
+        PackageDatabase::Dpkg => &["/var/lib/dpkg/status"],
+        PackageDatabase::Pacman => &["/var/lib/pacman/local"],
+        PackageDatabase::Rpm => &["/var/lib/rpm", "/usr/lib/sysimage/rpm"],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn store_has_content(paths: &[&str]) -> bool {
+    paths
+        .iter()
+        .any(|path| path_has_content(std::path::Path::new(path)))
+}
+
+#[cfg(target_os = "linux")]
+fn database_is_initialised(database: PackageDatabase) -> bool {
+    store_has_content(database_store(database))
+}
+
 /// Whether a tool's exit status means "no package owns this path" and not a
 /// failure.
 ///
@@ -812,6 +867,11 @@ fn query_owner(
     database: PackageDatabase,
     path: &std::path::Path,
 ) -> OwnerQuery {
+    // A database that was never initialised cannot answer, and asking it would
+    // report an error that says nothing about this file.
+    if !database_is_initialised(database) {
+        return OwnerQuery::Unavailable;
+    }
     let path = path.to_string_lossy();
     match database {
         PackageDatabase::Dpkg => query_dpkg(&path),
@@ -1352,9 +1412,10 @@ mod tests {
 mod install_source_tests {
     use super::{
         InstallSource, OwnedPackage, PackageDatabase, PackageFrontend,
-        classify_install_source, exit_means_not_owned, is_system_path,
-        parse_dpkg_fields, parse_dpkg_search, parse_pacman_architecture,
-        parse_pacman_owners, parse_rpm_records,
+        classify_install_source, database_store, exit_means_not_owned,
+        is_system_path, parse_dpkg_fields, parse_dpkg_search,
+        parse_pacman_architecture, parse_pacman_owners, parse_rpm_records,
+        path_has_content, store_has_content, system_command_path,
     };
 
     fn owned(
@@ -1687,5 +1748,45 @@ mod install_source_tests {
             .expect("apt should map to a managed install");
         assert!(deb.self_update_supported_with(true));
         assert_eq!(deb.package_variant(), Some("deb"));
+    }
+    #[test]
+    fn an_empty_store_means_the_database_was_never_initialised() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let populated = root.path().join("populated");
+        std::fs::create_dir(&populated).unwrap();
+        std::fs::write(populated.join("status"), "").unwrap();
+        let file = root.path().join("status");
+        std::fs::write(&file, "").unwrap();
+
+        assert!(!path_has_content(&empty));
+        assert!(path_has_content(&populated));
+        assert!(path_has_content(&file));
+        assert!(!path_has_content(&root.path().join("missing")));
+
+        let empty = empty.to_string_lossy().into_owned();
+        let populated = populated.to_string_lossy().into_owned();
+        assert!(!store_has_content(&[empty.as_str()]));
+        assert!(store_has_content(&[empty.as_str(), populated.as_str()]));
+    }
+
+    #[test]
+    fn every_database_names_the_store_it_queries() {
+        for database in [
+            PackageDatabase::Dpkg,
+            PackageDatabase::Pacman,
+            PackageDatabase::Rpm,
+        ] {
+            assert!(!database_store(database).is_empty());
+        }
+    }
+
+    #[test]
+    fn system_programs_resolve_to_an_absolute_path() {
+        assert!(system_command_path("").is_none());
+        assert!(system_command_path("bin/sh").is_none());
+        let sh = system_command_path("sh").expect("sh should be installed");
+        assert!(sh.is_absolute());
     }
 }
